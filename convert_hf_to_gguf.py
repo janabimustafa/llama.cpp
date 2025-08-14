@@ -6953,7 +6953,7 @@ class Glm4MoeModel(TextModel):
         self, data_torch: Tensor, name: str, bid: int | None
     ) -> Iterable[tuple[str, Tensor]]:
         if name.startswith("model.visual."):  # ignore visual part
-            return []
+            return [] 
         elif name.startswith("model.language_model."):
             name = name.replace("language_model.", "")  # for multimodal variants
 
@@ -7008,7 +7008,580 @@ class Glm4MoeModel(TextModel):
             if len(experts) > 0:
                 raise ValueError(f"Unprocessed experts: {experts}")
 
+# convert_hf_to_gguf.py  (excerpt)
+@ModelBase.register("Glm4vMoeForConditionalGeneration")
+class Glm4vMoeTextModel(TextModel):
+    """
+    GLM-4.5V text-only exporter compatible with the existing GLM4_MOE tensor map.
+    - Ignores vision tensors
+    - Strips 'model.language_model.' prefix
+    - Writes mRoPE metadata
+    - Packs routed experts per layer into 3 tensors:
+        * experts.down_proj.weight   -> FFN_DOWN_EXP
+        * experts.gate_proj.weight   -> FFN_GATE_EXP
+        * experts.up_proj.weight     -> FFN_UP_EXP
+      (If checkpoint stores fused gate_up_proj, we split it into gate/up.)
+    - Leaves shared experts under 'shared_experts.(gate_proj|up_proj|down_proj).*'
+      so they hit FFN_*_SHEXP buckets.
+    """
+    model_arch = gguf.MODEL_ARCH.GLM4_MOE
+    _experts: Optional[List[dict]] = None
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.block_count = int(self.hparams["num_hidden_layers"]) + int(self.hparams.get("num_nextn_predict_layers", 0) or 0)
+        self.tensor_map  = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    # ---------------- vocab ----------------
+
+    def set_vocab(self):
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
+
+        tokens, toktypes, tokpre = self.get_vocab_base()
+        self.gguf_writer.add_tokenizer_model("gpt2")
+        self.gguf_writer.add_tokenizer_pre(tokpre)
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_types(toktypes)
+
+        # Match your existing Glm4MoeModel behavior
+        special_vocab._set_special_token("bos", tokenizer.get_added_vocab()["[gMASK]"])       # 151331
+        special_vocab._set_special_token("eot", tokenizer.get_added_vocab()["<|user|>"])      # 151336
+        special_vocab._set_special_token("unk", tokenizer.get_added_vocab()["<|endoftext|>"]) # 151329
+        special_vocab._set_special_token("eom", tokenizer.get_added_vocab()["<|observation|>"])  # 151338
+
+        # Patch the known chat_template quirk
+        if isinstance(special_vocab.chat_template, str) and "visible_text(m.content).endswith" in special_vocab.chat_template:
+            special_vocab.chat_template = special_vocab.chat_template.replace(
+                """{{ visible_text(m.content) }}\n{{- '/nothink' if (enable_thinking is defined and not enable_thinking and not visible_text(m.content).endswith("/nothink")) else '' -}}""",
+                """{% set content = visible_text(m.content) %}{{ content }}\n{{- '/nothink' if (enable_thinking is defined and not enable_thinking and not content.endswith("/nothink")) else '' -}}"""
+            )
+
+        special_vocab.add_to_gguf(self.gguf_writer)
+
+    # --------------- gguf params ---------------
+    
+    def _meta(self, key: str, value):
+        # older/newer gguf-py variants vary; prefer add_additional_metadata
+        if hasattr(self.gguf_writer, "add_additional_metadata"):
+            self.gguf_writer.add_additional_metadata(key, value)
+        # else: silently no-op; metadata is optional for runtime
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        rope_dim = self.hparams.get("head_dim") or (self.hparams["hidden_size"] // self.hparams["num_attention_heads"])
+        # mRoPE hints (optional metadata; runtime still needs codepaths)
+        self._meta("rope.mrope_enabled", True)
+        rs = self.hparams.get("rope_scaling") or {}
+        if "mrope_section" in rs:
+            self._meta("rope.mrope_section", rs["mrope_section"])  # e.g. [8,12,12]
+        self.gguf_writer.add_rope_dimension_count(int(rope_dim * self.hparams.get("partial_rotary_factor", 0.5)))
+
+        # MoE parameters (same style as Glm4MoeModel)
+        if (v := self.hparams.get("n_routed_experts")) is not None:
+            self.gguf_writer.add_expert_count(int(v))
+        if (v := self.hparams.get("moe_intermediate_size")) is not None:
+            self.gguf_writer.add_expert_feed_forward_length(int(v))
+        if (v := self.hparams.get("n_shared_experts")) is not None:
+            self.gguf_writer.add_expert_shared_count(int(v))
+        if (v := self.hparams.get("first_k_dense_replace")) is not None:
+            self.gguf_writer.add_leading_dense_block_count(int(v))
+
+        self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
+        if (v := self.hparams.get("routed_scaling_factor")) is not None:
+            self.gguf_writer.add_expert_weights_scale(float(v))
+        if (v := self.hparams.get("norm_topk_prob")) is not None:
+            self.gguf_writer.add_expert_weights_norm(bool(v))
+        if (v := self.hparams.get("num_nextn_predict_layers")) is not None:
+            self.gguf_writer.add_nextn_predict_layers(int(v))
+
+    # --------------- tensor mapping ---------------
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: Optional[int]) -> Iterable[Tuple[str, Tensor]]:
+        # ignore vision
+        if name.startswith("model.visual."):
+            return []
+
+        # strip multimodal prefix
+        if name.startswith("model.language_model."):
+            name = "model." + name[len("model.language_model."):]
+
+        # embeddings
+        if name == "model.embed_tokens.weight" and ".layers." not in name:
+            return [(self.map_tensor_name("token_embd.weight"), data_torch)]
+
+        # routed experts -> stash & emit when complete
+        if ".mlp.experts." in name:
+            assert bid is not None, "expert tensor without block id"
+            if self._experts is None:
+                self._experts = [{} for _ in range(self.block_count)]
+            self._experts[bid][name] = data_torch
+
+            out = self._maybe_emit_experts_like_glm4(bid, int(self.hparams["n_routed_experts"]))
+            return out if out is not None else []
+
+        # shared experts: DO NOT rename; leave as 'shared_experts.*'
+        if bid is not None and f"model.layers.{bid}.mlp.shared_experts." in name:
+            return [(self.map_tensor_name(name), data_torch)]
+
+        # rare rename
+        if name.endswith("e_score_correction_bias"):
+            name = name.replace("e_score_correction_bias", "e_score_correction.bias")
+
+        return [(self.map_tensor_name(name), data_torch)]
+
+    # --------------- expert packer ---------------
+
+    def _maybe_emit_experts_like_glm4(self, bid: int, n_experts: int) -> Optional[List[Tuple[str, Tensor]]]:
+        """
+        Produce the 3 merged routed-expert tensors per layer with names that match
+        FFN_*_EXP in tensor_mapping.py:
+          - model.layers.{bid}.mlp.experts.down_proj.weight  [E, O, I]
+          - model.layers.{bid}.mlp.experts.gate_proj.weight  [E, O, I]
+          - model.layers.{bid}.mlp.experts.up_proj.weight    [E, O, I]
+        Accept either split (gate_proj & up_proj) or fused (gate_up_proj) from HF.
+        Only weights are merged (like Glm4MoeModel).
+        """
+        stash = self._experts[bid]
+
+        def have_all(part: str) -> bool:
+            return all(f"model.layers.{bid}.mlp.experts.{x}.{part}.weight" in stash for x in range(n_experts))
+
+        have_down    = have_all("down_proj")
+        have_gate    = have_all("gate_proj")
+        have_up      = have_all("up_proj")
+        have_gate_up = have_all("gate_up_proj")
+
+        if not have_down or not ((have_gate and have_up) or have_gate_up):
+            return None
+
+        out: List[Tuple[str, Tensor]] = []
+
+        # down_proj -> [E, O, I]
+        downs = [stash.pop(f"model.layers.{bid}.mlp.experts.{x}.down_proj.weight") for x in range(n_experts)]
+        W_down = torch.stack(downs, dim=0)
+        out.append((self.map_tensor_name(f"model.layers.{bid}.mlp.experts.down_proj.weight"), W_down))
+
+        # gate/up: split or fused->split
+        if have_gate and have_up:
+            gates = [stash.pop(f"model.layers.{bid}.mlp.experts.{x}.gate_proj.weight") for x in range(n_experts)]
+            ups   = [stash.pop(f"model.layers.{bid}.mlp.experts.{x}.up_proj.weight")   for x in range(n_experts)]
+            W_gate = torch.stack(gates, dim=0)
+            W_up   = torch.stack(ups,   dim=0)
+        else:
+            fused = [stash.pop(f"model.layers.{bid}.mlp.experts.{x}.gate_up_proj.weight") for x in range(n_experts)]
+            W_fused = torch.stack(fused, dim=0)      # [E, 2O, I]
+            O2 = W_fused.shape[1]
+            assert O2 % 2 == 0, f"Expected even 2O for gate_up_proj, got {O2}"
+            O = O2 // 2
+            W_gate = W_fused[:, :O, :].contiguous()  # [E, O, I]
+            W_up   = W_fused[:,  O:, :].contiguous() # [E, O, I]
+
+        out.append((self.map_tensor_name(f"model.layers.{bid}.mlp.experts.gate_proj.weight"), W_gate))
+        out.append((self.map_tensor_name(f"model.layers.{bid}.mlp.experts.up_proj.weight"),   W_up))
+        return out
+
+    # --------------- finalize ---------------
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+        if self._experts is not None:
+            leftovers = [k for d in self._experts for k in d.keys()]
+            if leftovers:
+                raise ValueError(f"Unprocessed experts: {leftovers}")
+@ModelBase.register("Glm4vMoeForConditionalGeneration")
+class Glm4vMoeModel(MmprojModel):
+    """
+    GLM-4.5V MoE multimodal converter (vision encoder + projector), based on MmprojModel.
+
+    Writes:
+      • Vision encoder weights (ViT/CLIP-style) into llama.cpp V_* tensor names
+      • Vision→text projector (single FC) from GLM merger.proj → "mm.model.fc.{weight,bias}"
+      • Vision metadata (image size, patch size, hidden, heads, layers, mean/std, projection dim)
+
+    Does NOT write:
+      • Text LLM weights or tokenizer (convert text model separately)
+    """
+    model_arch  = gguf.MODEL_ARCH.MMPROJ
+    model_type  = ModelType.MMPROJ
+
+    has_vision_encoder = True
+    has_audio_encoder  = False
+
+    # legacy projector prefixes (if a future ckpt exposes them); we also map merger.proj below
+    _MM_PROJ_PATTERNS = [
+        r"^model\.mm_projector\.",
+        r"^model\.visual\.mm_projector\.",
+        r"^model\.(vision_proj|image_proj)\.",
+        r"^model\.(multi_)?modal(_)?project(or)?\.",
+    ]
+
+    # track what's written per vision block (for sanity checks)
+    _v_written: Dict[int, Set[str]] = {}
+
+    # ------------------- helpers to track required tensors -------------------
+    def _mark(self, bid: int, kind: str):
+        self._v_written.setdefault(bid, set()).add(kind)
+
+    def prepare_tensors(self):
+        # let parent read the state dict first
+        super().prepare_tensors()
+        # Verify minimal set of weights per encoder block (RMSNorm ⇒ no bias)
+        depth = int((self.hparams_vision or {}).get("num_hidden_layers")
+                    or (self.hparams_vision or {}).get("depth", 0))
+        missing = []
+        for i in range(depth):
+            seen = self._v_written.get(i, set())
+            needed = {
+                "ln1.weight",
+                "attn_q.weight", "attn_k.weight", "attn_v.weight",
+                "attn_out.weight",
+                "ln2.weight",
+                "ffn_up.weight", "ffn_down.weight",
+            }
+            for need in needed:
+                if need not in seen:
+                    missing.append((i, need))
+        if missing:
+            raise ValueError(f"Missing essential vision tensors: {missing}")
+
+    # ------------------- projector prefix normalization helpers -------------------
+    @staticmethod
+    def _is_mmproj(name: str) -> bool:
+        return any(re.match(p, name) for p in Glm4vMoeModel._MM_PROJ_PATTERNS)
+
+    @staticmethod
+    def _normalize_proj_prefix(name: str) -> str:
+        # Normalize projector to 'model.mm_projector.'
+        name = re.sub(r"^model\.visual\.mm_projector\.", "model.mm_projector.", name)
+        name = re.sub(r"^model\.(vision_proj|image_proj)\.", "model.mm_projector.", name)
+        name = re.sub(r"^model\.(multi_)?modal(_)?project(or)?\.", "model.mm_projector.", name)
+        return name
+
+    @staticmethod
+    def _proj_layer_and_param(norm: str):
+        # Return (layer_idx, 'weight'|'bias'), where layer_idx is None for single-layer FC
+        m = re.search(r"\.(\d+)\.(weight|bias)$", norm)
+        if m:
+            return int(m.group(1)), m.group(2)
+        m = re.search(r"\.(weight|bias)$", norm)
+        if m:
+            return None, m.group(1)
+        return None, None
+
+    # ------------------- vision-config normalization -------------------
+    @staticmethod
+    def _fold_patch_weight_to_3ch(t: Tensor) -> Tensor:
+        """
+        Convert patch-embed weight to 4D conv with 3 input channels.
+
+        Accepts:
+          - 4D: (O, Cin, kH, kW) -> as-is
+          - 5D: (O, Cin, D, kH, kW) or (O, D, Cin, kH, kW)  [GLM-4.5V uses (O,3,2,14,14)]
+          - ND>4: (O, *, kH, kW) with one middle dim == 3 (Cin), others reduced
+
+        Policy:
+          - Identify the middle axis whose size == 3 and treat it as Cin
+          - Reduce (mean) across all *other* middle axes so input channels remain 3
+          - Return contiguous tensor of shape (O, 3, kH, kW)
+        """
+        if t.ndim == 4:
+            return t
+        O = t.shape[0]
+        kH, kW = t.shape[-2], t.shape[-1]
+        middle = t.shape[1:-2]
+        if not middle:
+            return t
+
+        mid_axes = list(range(1, t.ndim - 2))
+        three_axes = [ax for ax in mid_axes if t.shape[ax] == 3]
+        if not three_axes:
+            # last resort: flatten to (O, Cin_flat, kH, kW)
+            return t.reshape(O, int(torch.prod(torch.tensor(middle))), kH, kW).contiguous()
+
+        cin_ax = three_axes[0]
+        reduce_axes = [ax for ax in mid_axes if ax != cin_ax]
+        x = t
+        for ax in sorted(reduce_axes, reverse=True):
+            x = x.mean(dim=ax, keepdim=False)
+
+        # move the 3-sized axis to dim=1
+        mid_axes2 = list(range(1, x.ndim - 2))
+        cin_ax2 = next(ax for ax in mid_axes2 if x.shape[ax] == 3)
+        if cin_ax2 != 1:
+            perm = [0, cin_ax2] + [ax for ax in mid_axes2 if ax != cin_ax2] + [x.ndim - 2, x.ndim - 1]
+            x = x.permute(perm).contiguous()
+
+        # if leftover middle dims remain, reduce them
+        while x.ndim > 4:
+            x = x.mean(dim=2, keepdim=False)
+        return x
+
+    def _vget(self, *keys, default=None):
+        vc = self.hparams_vision or {}
+        for k in keys:
+            if k in vc:
+                return vc[k]
+        return default if default is not None else None
+
+    def _normalize_vision_config(self):
+        if self.hparams_vision is None:
+            self.hparams_vision = {}
+        vc = self.hparams_vision
+
+        vc.setdefault("image_size",          self._vget("image_size", "vision_image_size", "resolution"))
+        vc.setdefault("patch_size",          self._vget("patch_size", "vision_patch_size"))
+        vc.setdefault("hidden_size",         self._vget("hidden_size", "width", "embed_dim", "vision_hidden_size"))
+        vc.setdefault("num_hidden_layers",   self._vget("num_hidden_layers", "depth", "layers"))
+        vc.setdefault("num_attention_heads", self._vget("num_attention_heads", "num_heads", "heads"))
+
+        # derive intermediate_size if only a ratio is provided
+        if "intermediate_size" not in vc or vc["intermediate_size"] is None:
+            inter = self._vget("intermediate_size")
+            if inter is None:
+                hs = vc.get("hidden_size")
+                mr = self._vget("mlp_ratio", "ffn_ratio")
+                if isinstance(hs, int) and isinstance(mr, (int, float)):
+                    inter = int(round(hs * mr))
+            if inter is not None:
+                vc["intermediate_size"] = inter
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._normalize_vision_config()
+
+    # ------------------- metadata / KV -------------------
+    def set_gguf_parameters(self):
+        # Let the base add the generic vision/audio + preprocessor info
+        super().set_gguf_parameters()
+
+        # Fix vision FFN width: prefer 'out_hidden_size' (GLM-4.5V = 4096)
+        n_ff = self._vget("out_hidden_size", "intermediate_size")
+        if n_ff is not None:
+            try:
+                self.gguf_writer.add_vision_feed_forward_length(int(n_ff))
+            except Exception:
+                if hasattr(self.gguf_writer, "add_u32"):
+                    self.gguf_writer.add_u32("clip.vision.feed_forward_length", int(n_ff))
+
+        # Vision attention LN epsilon (some builds expect this key)
+        eps = (
+            self._vget("layer_norm_epsilon", "layer_norm_eps", "norm_eps")
+            or getattr(self, "hparams", {}).get("rms_norm_eps")
+            or 1e-5
+        )
+        eps = float(eps)
+        try:
+            self.gguf_writer.add_vision_attention_layer_norm_epsilon(eps)
+        except Exception:
+            if hasattr(self.gguf_writer, "add_float32"):
+                self.gguf_writer.add_float32("clip.vision.attention.layer_norm_epsilon", float(eps))
+
+        # Mark GLM-4.5V MLP as gated (harmless hint; some trees read it)
+        try:
+            if hasattr(self.gguf_writer, "add_bool"):
+                self.gguf_writer.add_bool("clip.vision.mlp_gated", True)
+                self.gguf_writer.add_bool("vision.mlp_gated", True)  # alias
+        except Exception:
+            pass
+
+        # Activation hint (string)
+        act = (self._vget("hidden_act") or "silu").lower()
+        try:
+            if hasattr(self.gguf_writer, "add_string"):
+                self.gguf_writer.add_string("clip.vision.ffn_activation", act)
+                self.gguf_writer.add_string("vision.ffn_activation", act)
+        except Exception:
+            pass
+
+        # Tell llama.cpp there IS an llava-style projector and its output dim
+        try:
+            self.gguf_writer.add_image_projector_type("mlp")
+        except Exception:
+            # fallback for older gguf-py
+            if hasattr(self.gguf_writer, "add_string"):
+                self.gguf_writer.add_string("clip.projector_type", "mlp")
+        try:
+            # preferred helper in recent trees
+            self.gguf_writer.add_has_llava_proj(True)
+        except Exception:
+            if hasattr(self.gguf_writer, "add_bool"):
+                self.gguf_writer.add_bool("clip.has_llava_proj", True)
+
+        proj_dim = int(self.n_embd_text)  # 4096 from text_config.hidden_size
+        try:
+            self.gguf_writer.add_vision_projection_dim(proj_dim)
+        except Exception:
+            if hasattr(self.gguf_writer, "add_u32"):
+                self.gguf_writer.add_u32("clip.vision.projection_dim", proj_dim)
+
+        # (optional) record projector type for debuggability
+        try:
+            self.gguf_writer.add_image_projector_type("fc")
+        except Exception:
+            pass
+
+    def write_vocab(self):
+        # Mmproj pack does not write vocab; base will raise if misused
+        super().write_vocab()
+
+    # ------------------- weights mapping -------------------
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None):
+        # 0) GLM-4.5V projector: map merger.proj -> mm.model.fc and mm.model.mlp.0
+        if name.startswith("model.visual.merger.proj."):
+            W_or_b = "weight" if name.endswith(".weight") else "bias"
+            base_fc  = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_MMPROJ_FC]          # "mm.model.fc"
+            base_mlp = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_MMPROJ_MLP].format(bid=0)  # "mm.model.mlp.0"
+            return [
+                (f"{base_fc}.{W_or_b}",  data_torch),
+                (f"{base_mlp}.{W_or_b}", data_torch),
+            ]
+
+        # 1) Legacy projector module names (if ever present)
+        if self._is_mmproj(name):
+            norm = self._normalize_proj_prefix(name)
+            layer_idx, param = self._proj_layer_and_param(norm)
+            if param is None:
+                return []
+            if layer_idx is None:
+                base = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_MMPROJ_FC]  # "mm.model.fc"
+                return [(f"{base}.{param}", data_torch)]
+            base = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_MMPROJ_MLP].format(bid=layer_idx)  # "mm.model.mlp.{bid}"
+            return [(f"{base}.{param}", data_torch)]
+
+        # 2) Vision encoder (ViT/CLIP-like). Include encoder weights.
+        if not name.startswith("model.visual."):
+            # Drop any text-model params; this pack is strictly vision+projector
+            return []
+
+        short = name[len("model.visual."):]
+        outs: List[Tuple[str, Tensor]] = []
+
+        # --- embeddings / stems ---
+        if short in ("class_embedding", "class_token", "cls_token", "cls_emb", "class_emb"):
+            outs.append((gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_EMBD_CLS], data_torch))
+            return outs
+
+        if short.startswith(("positional_embedding", "pos_embed", "position_embed", "positional_embedding.weight")):
+            outs.append((gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_EMBD_POS], data_torch))
+            return outs
+
+        # patch embedding (GLM-4.5V uses 5-D weight: [O, 3, T, kH, kW], T=2)
+        if short.startswith(("conv1.", "patch_embed.proj.")):
+            base = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_EMBD_PATCH]
+            if short.endswith(".weight"):
+                w = self._fold_patch_weight_to_3ch(data_torch)
+                return [(f"{base}.weight", w)]
+            if short.endswith(".bias"):
+                outs.append((f"{base}.bias", data_torch)); return outs
+
+        # optional global norms
+        if re.search(r"(ln_pre|pre_ln|norm_pre)\.(weight|bias)$", short):
+            base = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_PRE_NORM]
+            outs.append((f"{base}.{short.split('.')[-1]}", data_torch)); return outs
+        if re.search(r"(ln_post|post_ln|norm_post)\.(weight|bias)$", short):
+            base = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_POST_NORM]
+            outs.append((f"{base}.{short.split('.')[-1]}", data_torch)); return outs
+
+        # --- transformer blocks ---
+        m = re.search(r"(?:resblocks|blocks|encoder\.layers)\.(\d+)\.", short)
+        if m:
+            bid = int(m.group(1))
+
+            # layer-scale (optional)
+            if re.search(r"(ls1|layer_scale_1)\.(weight|gamma)$", short):
+                base = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_LAYER_SCALE_1].format(bid=bid)
+                outs.append((base, data_torch)); return outs
+            if re.search(r"(ls2|layer_scale_2)\.(weight|gamma)$", short):
+                base = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_LAYER_SCALE_2].format(bid=bid)
+                outs.append((base, data_torch)); return outs
+
+            # norms (RMSNorm → weight only in practice, but accept bias if present)
+            m1 = re.search(r"(ln_1|norm1|ln1)\.(weight|bias)$", short)
+            if m1:
+                base = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_INPUT_NORM].format(bid=bid)
+                suf = m1.group(2)
+                outs.append((f"{base}.{suf}", data_torch))
+                if suf == "weight": self._mark(bid, "ln1.weight")
+                return outs
+
+            m2 = re.search(r"(ln_2|norm2|ln2)\.(weight|bias)$", short)
+            if m2:
+                base = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_POST_ATTN_NORM].format(bid=bid)
+                suf = m2.group(2)
+                outs.append((f"{base}.{suf}", data_torch))
+                if suf == "weight": self._mark(bid, "ln2.weight")
+                return outs
+
+            # optional q/k norms
+            if re.search(r"attn\.(q_norm|k_norm)\.(weight|bias)$", short):
+                if ".q_norm." in short:
+                    base = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_ATTN_Q_NORM].format(bid=bid)
+                else:
+                    base = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_ATTN_K_NORM].format(bid=bid)
+                outs.append((f"{base}.{short.split('.')[-1]}", data_torch)); return outs
+
+            # Attention inputs: separate q/k/v are not present in GLM-4.5V; it uses in-proj / qkv in some models.
+            if short.endswith(("attn.in_proj_weight", "attn.qkv.weight")):
+                q_w, k_w, v_w = torch.chunk(data_torch, 3, dim=0)
+                outs += [
+                    (gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_ATTN_Q].format(bid=bid) + ".weight", q_w),
+                    (gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_ATTN_K].format(bid=bid) + ".weight", k_w),
+                    (gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_ATTN_V].format(bid=bid) + ".weight", v_w),
+                ]
+                self._mark(bid, "attn_q.weight"); self._mark(bid, "attn_k.weight"); self._mark(bid, "attn_v.weight")
+                return outs
+            if short.endswith(("attn.in_proj_bias", "attn.qkv.bias")):
+                q_b, k_b, v_b = torch.chunk(data_torch, 3, dim=0)
+                outs += [
+                    (gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_ATTN_Q].format(bid=bid) + ".bias", q_b),
+                    (gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_ATTN_K].format(bid=bid) + ".bias", k_b),
+                    (gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_ATTN_V].format(bid=bid) + ".bias", v_b),
+                ]
+                return outs
+
+            # GLM-4.5V exposes only attn.proj (the output). Map it:
+            if re.search(r"attn\.(out_proj|proj|o)\.(weight|bias)$", short):
+                base = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_ATTN_O].format(bid=bid)
+                suf = short.rsplit(".", 1)[-1]
+                outs.append((f"{base}.{suf}", data_torch))
+                if suf == "weight": self._mark(bid, "attn_out.weight")
+                return outs
+
+            # --- MLP: up_proj / gate_proj / down_proj ---
+            if re.search(r"mlp\.up_proj\.(weight|bias)$", short):
+                base = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_FFN_UP].format(bid=bid)
+                suf  = short.rsplit(".", 1)[-1]
+                if suf == "weight":
+                    outs.append((f"{base}.weight", data_torch.t().contiguous()))
+                    self._mark(bid, "ffn_up.weight")
+                else:
+                    outs.append((f"{base}.bias", data_torch))
+                return outs
+
+            if re.search(r"mlp\.gate_proj\.(weight|bias)$", short):
+                base = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_FFN_GATE].format(bid=bid)
+                suf  = short.rsplit(".", 1)[-1]
+                if suf == "weight":
+                    outs.append((f"{base}.weight", data_torch.t().contiguous()))
+                else:
+                    outs.append((f"{base}.bias", data_torch))
+                return outs
+
+            if re.search(r"mlp\.down_proj\.(weight|bias)$", short):
+                base = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_FFN_DOWN].format(bid=bid)
+                suf  = short.rsplit(".", 1)[-1]
+                if suf == "weight":
+                    outs.append((f"{base}.weight", data_torch.t().contiguous()))
+                    self._mark(bid, "ffn_down.weight")
+                else:
+                    outs.append((f"{base}.bias", data_torch))
+                return outs
+
+
+        # Nothing matched – safe to drop
+        return outs
 @ModelBase.register("GlmForCausalLM", "ChatGLMModel", "ChatGLMForConditionalGeneration")
 class ChatGLMModel(TextModel):
     model_arch = gguf.MODEL_ARCH.CHATGLM
