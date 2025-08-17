@@ -7010,7 +7010,7 @@ class Glm4MoeModel(TextModel):
 
 # convert_hf_to_gguf.py  (excerpt)
 @ModelBase.register("Glm4vMoeForConditionalGeneration")
-class Glm4vMoeTextModel(TextModel):
+class Glm4vMoeModel(Glm4MoeModel):
     """
     GLM-4.5V text-only exporter compatible with the existing GLM4_MOE tensor map.
     - Ignores vision tensors
@@ -7024,49 +7024,14 @@ class Glm4vMoeTextModel(TextModel):
     - Leaves shared experts under 'shared_experts.(gate_proj|up_proj|down_proj).*'
       so they hit FFN_*_SHEXP buckets.
     """
-    model_arch = gguf.MODEL_ARCH.GLM4_MOE
-    _experts: Optional[List[dict]] = None
+    model_arch = gguf.MODEL_ARCH.GLM4V_MOE
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.block_count = int(self.hparams["num_hidden_layers"]) + int(self.hparams.get("num_nextn_predict_layers", 0) or 0)
-        self.tensor_map  = gguf.get_tensor_name_map(self.model_arch, self.block_count)
 
-    # ---------------- vocab ----------------
-
-    def set_vocab(self):
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
-        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
-
-        tokens, toktypes, tokpre = self.get_vocab_base()
-        self.gguf_writer.add_tokenizer_model("gpt2")
-        self.gguf_writer.add_tokenizer_pre(tokpre)
-        self.gguf_writer.add_token_list(tokens)
-        self.gguf_writer.add_token_types(toktypes)
-
-        # Match your existing Glm4MoeModel behavior
-        special_vocab._set_special_token("bos", tokenizer.get_added_vocab()["[gMASK]"])       # 151331
-        special_vocab._set_special_token("eot", tokenizer.get_added_vocab()["<|user|>"])      # 151336
-        special_vocab._set_special_token("unk", tokenizer.get_added_vocab()["<|endoftext|>"]) # 151329
-        special_vocab._set_special_token("eom", tokenizer.get_added_vocab()["<|observation|>"])  # 151338
-
-        # Patch the known chat_template quirk
-        if isinstance(special_vocab.chat_template, str) and "visible_text(m.content).endswith" in special_vocab.chat_template:
-            special_vocab.chat_template = special_vocab.chat_template.replace(
-                """{{ visible_text(m.content) }}\n{{- '/nothink' if (enable_thinking is defined and not enable_thinking and not visible_text(m.content).endswith("/nothink")) else '' -}}""",
-                """{% set content = visible_text(m.content) %}{{ content }}\n{{- '/nothink' if (enable_thinking is defined and not enable_thinking and not content.endswith("/nothink")) else '' -}}"""
-            )
-
-        special_vocab.add_to_gguf(self.gguf_writer)
 
     # --------------- gguf params ---------------
-    
-    def _meta(self, key: str, value):
-        # older/newer gguf-py variants vary; prefer add_additional_metadata
-        if hasattr(self.gguf_writer, "add_additional_metadata"):
-            self.gguf_writer.add_additional_metadata(key, value)
-        # else: silently no-op; metadata is optional for runtime
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
 

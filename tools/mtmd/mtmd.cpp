@@ -153,6 +153,7 @@ struct mtmd_context {
         ctx_clip_params.use_gpu   = ctx_params.use_gpu;
         ctx_clip_params.verbosity = ctx_params.verbosity;
         auto res = clip_init(mmproj_fname, ctx_clip_params);
+        LOG_INF("%s: loaded mmproj from %s\n", __func__, mmproj_fname);
         ctx_v = res.ctx_v;
         ctx_a = res.ctx_a;
         if (!ctx_v && !ctx_a) {
@@ -172,7 +173,9 @@ struct mtmd_context {
 
         // since we already validate n_embd of vision and audio mmproj,
         // we can safely assume that they are the same
+        LOG_INF("%s: calling clip_n_mmproj_embd()\n", __func__);
         int n_embd_clip = clip_n_mmproj_embd(ctx_v ? ctx_v : ctx_a);
+        LOG_INF("%s: n_embd_clip = %d\n", __func__, n_embd_clip);
         if (n_embd_text != n_embd_clip) {
             throw std::runtime_error(string_format(
                 "mismatch between text model (n_embd = %d) and mmproj (n_embd = %d)\n"
@@ -242,7 +245,16 @@ struct mtmd_context {
             // <start_of_image> ... (image embeddings) ... <end_of_image>
             img_beg = "<start_of_image>";
             img_end = "<end_of_image>";
+        } else if (proj == PROJECTOR_TYPE_GLM45V) {
+              // GLM-4.5V text markers:
+            // <|begin_of_image|> ... (image embeddings) ... <|end_of_image|>
+            img_beg = "<|begin_of_image|>";
+            img_end = "<|end_of_image|>";
 
+            // (optional) sanity checks against your text_config IDs
+            // image_start_token_id = 151339, image_end_token_id = 151340
+            GGML_ASSERT(lookup_token(img_beg) == 151339);
+            GGML_ASSERT(lookup_token(img_end) == 151340);
         } else if (proj == PROJECTOR_TYPE_IDEFICS3) {
             // https://github.com/huggingface/transformers/blob/a42ba80fa520c784c8f11a973ca9034e5f859b79/src/transformers/models/idefics3/processing_idefics3.py#L192-L215
             img_beg = "<fake_token_around_image><global-img>";

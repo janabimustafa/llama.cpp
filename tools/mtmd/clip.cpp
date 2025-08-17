@@ -344,6 +344,34 @@ struct clip_model {
     ggml_tensor * mm_input_proj_w = nullptr;
     ggml_tensor * mm_soft_emb_norm_w = nullptr;
 
+    // glm4v_moe
+    ggml_tensor * glm_post_conv_rms_w      = nullptr; // glm4v.post_conv_rmsnorm.weight
+
+    // per-layer vision block (you already have layers[].{q_w,k_w,v_w,o_w, ln_*}, re-use them)
+    // q/k/v biases are nullptr for this config (attention_bias = false)
+
+    // post vision block RMS:
+    ggml_tensor * glm_post_rms_w           = nullptr; // glm4v.post_rmsnorm.weight
+
+    // downsample conv (k=stride=2)
+    ggml_tensor * glm_downsample_w         = nullptr; // glm4v.downsample.weight  [4096,1536,2,2]
+    ggml_tensor * glm_downsample_b         = nullptr; // glm4v.downsample.bias    [4096]
+
+    // merger: proj -> LN -> gated-MLP
+    ggml_tensor * glm_merger_proj_w        = nullptr; // glm4v.merger.proj.weight [1536,1536] (actually out_hidden_size)
+    ggml_tensor * glm_merger_proj_b        = nullptr; // glm4v.merger.proj.bias
+
+    ggml_tensor * glm_merger_ln_w          = nullptr; // glm4v.merger.ln.weight   [4096]
+    ggml_tensor * glm_merger_ln_b          = nullptr; // glm4v.merger.ln.bias     [4096]
+
+    ggml_tensor * glm_merger_gate_w        = nullptr; // glm4v.merger.mlp.gate    [10944,4096]
+    ggml_tensor * glm_merger_up_w          = nullptr; // glm4v.merger.mlp.up      [10944,4096]
+    ggml_tensor * glm_merger_down_w        = nullptr; // glm4v.merger.mlp.down    [4096,10944]
+    ggml_tensor * glm_merger_gate_b        = nullptr; // glm4v.merger.mlp.gate_bias
+    ggml_tensor * glm_merger_up_b          = nullptr; // glm4v.merger.mlp.up_bias
+    ggml_tensor * glm_merger_down_b        = nullptr; // glm4v.merger.mlp.down_bias
+
+
     // pixtral
     ggml_tensor * token_embd_img_break = nullptr;
     ggml_tensor * mm_patch_merger_w = nullptr;
@@ -551,6 +579,168 @@ struct clip_graph {
 
         return gf;
     }
+
+    ggml_cgraph * build_glm45v() {
+        // config sanity (from your JSON)
+        LOG_INF("%s: building GLM-4.5V compute graph\n", __func__);
+        GGML_ASSERT(n_embd == 1536);
+        GGML_ASSERT(n_head == 12);
+        GGML_ASSERT(n_layer == 24);
+        GGML_ASSERT(patch_size == 14);
+        GGML_ASSERT(hparams.spatial_merge_size == 2);
+        const int S = hparams.spatial_merge_size;          // 2
+        const int px = n_patches_x;
+        const int py = n_patches_y;
+        GGML_ASSERT((px % S) == 0 && (py % S) == 0);
+        LOG_INF("%s: building patchify layer\n", __func__);
+        // ---- 1) patchify (Conv2D with kernel=stride=14) -> [n_embd, n_patches]
+        ggml_tensor * cur = build_inp();                   // [n_embd=1536, n_patches=576]
+        LOG_INF("%s: built patchify layer\n", __func__);
+        // ---- 2) post-conv RMSNorm
+        GGML_ASSERT(model.glm_post_conv_rms_w);
+
+        cur = ggml_rms_norm(ctx0, cur, eps);
+        {
+            ggml_tensor *w = ggml_repeat(ctx0, model.glm_post_conv_rms_w, cur); // [C] -> [C, T]
+            cur = ggml_mul(ctx0, cur, w);
+        }
+
+        LOG_INF("%s: built post-conv RMSNorm layer\n", __func__);
+        // ---- 3) 2D RoPE on merged grid (tokens keep 576, but positions tie 2x2 cells)
+        // we feed positions as inputs (host must fill them)
+        ggml_tensor * pos_h = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches);
+        ggml_tensor * pos_w = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches);
+        ggml_set_name(pos_h, "pos_h");
+        ggml_set_name(pos_w, "pos_w");
+        ggml_set_input(pos_h);
+        ggml_set_input(pos_w);
+        LOG_INF("%s: built 2D position tensors\n", __func__);
+        // ^ host should set:
+        //   for each token (xh,yh) in 24x24 grid:
+        //     pos_h[idx] = yh / 2;  pos_w[idx] = xh / 2;   // integer divide
+        // which yields a 12x12 position grid shared across each 2x2 block
+
+        // ---- 4) Vision transformer (24 blocks, RMSNorm in-block)
+        // reuse your generic ViT builder but provide 2D rope applier
+        auto add_pos = [&](ggml_tensor * t, const clip_layer &) {
+            return build_rope_2d(ctx0, t, pos_h, pos_w, hparams.rope_theta /*10000.0f*/, /*interleave_freq=*/true);
+        };
+
+        cur = build_vit(
+            /*inp=*/cur,
+            /*n_pos=*/n_patches,       // 24*24
+            /*norm_type=*/NORM_TYPE_RMS,
+            /*ffn_op=*/hparams.ffn_op,
+            /*learned_pos_embd=*/nullptr,
+            /*add_pos=*/add_pos
+        );
+        GGML_ASSERT(cur->ne[0] == n_embd);      // 1536 channels out of ViT
+        GGML_ASSERT(cur->ne[1] == n_patches);   // 24*24
+
+        // ---- 5) post vision RMSNorm (glm4v.post_layernorm)
+        GGML_ASSERT(model.glm_post_rms_w);
+        // log cur
+        LOG_INF("%s: built post-vision RMSNorm layer\n", __func__);
+        LOG_INF("%s: cur shape: [%d, %d]\n", __func__, cur->ne[0], cur->ne[1]);
+        LOG_INF("%s: cur RMSNorm epsilon: %f\n", __func__, eps);
+        cur = ggml_rms_norm(ctx0, cur, eps);
+        {
+            ggml_tensor *w = ggml_repeat(ctx0, model.glm_post_rms_w, cur);
+            cur = ggml_mul(ctx0, cur, w);
+        }
+
+        LOG_INF("%s: built post-vision RMSNorm layer 2\n", __func__);
+        LOG_INF("%s: cur shape: [%d, %d]\n", __func__, cur->ne[0], cur->ne[1]);
+
+        // ---- 6) reshape to 2D grid and downsample conv2d (kernel=stride=2) to out_hidden=4096
+        // cur: [1536, 576] -> [1536, px, py] -> [1536, py, px] (whcn layout tricks)
+        
+        cur = ggml_reshape_3d(ctx0, cur, px, py, n_embd);  // [w, h, c]
+        cur = ggml_cont(ctx0, cur);
+
+        LOG_INF("%s: built reshape to 2D grid layer\n", __func__);
+        LOG_INF("%s: cur shape: [%d, %d, %d]\n", __func__, cur->ne[0], cur->ne[1], cur->ne[2]);
+        // Invariants now:
+        GGML_ASSERT(cur->ne[0] == px);
+        GGML_ASSERT(cur->ne[1] == py);
+        GGML_ASSERT(cur->ne[2] == n_embd);
+
+        // Conv expects [w, h, c, b] and weight shaped [kw, kh, c_in, c_out] (your helpers already handle it)
+        GGML_ASSERT(model.glm_downsample_w);
+
+        // w for downsample conv: ggml expects [kw, kh, c_in, c_out]
+        ggml_tensor *wds = model.glm_downsample_w;
+        LOG_INF("%s: wds shape: [%d, %d, %d, %d]\n", __func__, wds->ne[0], wds->ne[1], wds->ne[2], wds->ne[3]);
+
+        // If the tensor looks like OIHW ([out, in, kh, kw] = 4096,1536,2,2), permute it:
+        if (wds->ne[0] > 16 && wds->ne[1] > 16 && wds->ne[2] <= 8 && wds->ne[3] <= 8) {
+            // OIHW -> [kw, kh, c_in, c_out]
+            wds = ggml_permute(ctx0, wds, 3, 2, 1, 0);
+            wds = ggml_cont(ctx0, wds);
+        }
+
+        LOG_INF("%s: wds shape2: [%d, %d, %d, %d]\n", __func__, wds->ne[0], wds->ne[1], wds->ne[2], wds->ne[3]);
+
+
+        // input is [w, h, c, b]
+        GGML_ASSERT(cur->ne[0] == n_patches_x && cur->ne[1] == n_patches_y && cur->ne[2] == n_embd);
+        GGML_ASSERT(cur->ne[2] == wds->ne[2] && "downsample c_in mismatch");
+
+        cur = ggml_conv_2d(ctx0, wds, cur, S, S, 0, 0, 1, 1);
+        if (model.glm_downsample_b) {
+            cur = ggml_add(ctx0, cur, model.glm_downsample_b);
+        }
+
+        LOG_INF("%s: built downsample conv layer\n", __func__);
+        LOG_INF("%s: cur shape: [%d, %d]\n", __func__, cur->ne[0], cur->ne[1]);
+        LOG_INF("%s: cur ne shape: [%d, %d, %d, %d]\n", __func__, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+        LOG_INF("%s: downsample weight shape: [%d, %d, %d, %d]\n", __func__, wds->ne[0], wds->ne[1], wds->ne[2], wds->ne[3]);
+        GGML_ASSERT(cur->ne[2] == model.glm_downsample_w->ne[3]); // c_out = 4096
+        GGML_ASSERT(cur->ne[0] == px / S && cur->ne[1] == py / S);
+        // cur: [W', H', C_out, 1]  == [12, 12, 4096, 1]
+        LOG_INF("%s: conv out: [%lld,%lld,%lld,%lld]\n",
+                __func__, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+
+        const int64_t c_out  = cur->ne[2];               // 4096
+        const int64_t tokens = cur->ne[0] * cur->ne[1];  // 12 * 12 = 144
+
+        // Directly reshape to [C_out, tokens]
+        cur = ggml_reshape_2d(ctx0, cur, c_out, tokens); // [4096, 144]
+        cur = ggml_cont(ctx0, cur); // optional, but nice before matmul
+
+        GGML_ASSERT(cur->ne[0] == model.glm_downsample_w->ne[3]);       // 4096
+        GGML_ASSERT(cur->ne[1] == (px / S) * (py / S));                 // 144
+
+        // ---- 7) PatchMerger: proj → LN → gated-MLP(silu) → down
+        // proj
+        GGML_ASSERT(model.glm_merger_proj_w);
+        GGML_ASSERT(cur->ne[0] == model.glm_merger_proj_w->ne[1] && "merger proj in dim mismatch");
+        cur = ggml_mul_mat(ctx0, model.glm_merger_proj_w, cur);
+        if (model.glm_merger_proj_b) {
+            cur = ggml_add(ctx0, cur, model.glm_merger_proj_b);
+        }
+
+        // LayerNorm (epsilon = 1e-5 in HF LayerNorm)
+        GGML_ASSERT(model.glm_merger_ln_w && model.glm_merger_ln_b);
+        cur = build_norm(cur, model.glm_merger_ln_w, model.glm_merger_ln_b, NORM_TYPE_NORMAL, 1e-5f, -1);
+
+        // gated-MLP: down( silu(gate(x)) * up(x) )
+        cur = build_ffn(
+            /*cur=*/cur,
+            /*up=*/model.glm_merger_up_w,
+            /*up_b=*/model.glm_merger_up_b,
+            /*gate=*/model.glm_merger_gate_w,
+            /*gate_b=*/model.glm_merger_gate_b,
+            /*down=*/model.glm_merger_down_w,
+            /*down_b=*/model.glm_merger_down_b,
+            /*type_op=*/FFN_SILU,
+            /*il=*/-1
+        );
+
+        ggml_build_forward_expand(gf, cur);
+        return gf;
+    }
+
 
     ggml_cgraph * build_pixtral() {
         const int n_merge = hparams.spatial_merge_size;
@@ -1698,13 +1888,19 @@ private:
     // returns tensor with shape [n_embd, n_patches]
     ggml_tensor * build_inp() {
         ggml_tensor * inp_raw = build_inp_raw();
+        LOG_INF("%s: built raw input tensor\n", __func__);
+        // log parameters passed to ggml_conv_2d
+        LOG_INF("%s: patch_size=%d, stride=%d, padding=%d\n", __func__, patch_size, 1, 0);
         ggml_tensor * inp = ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_raw, patch_size, patch_size, 0, 0, 1, 1);
+        LOG_INF("%s: built patch embeddings\n", __func__);
         inp = ggml_reshape_2d(ctx0, inp, n_patches, n_embd);
         inp = ggml_cont(ctx0, ggml_transpose(ctx0, inp));
         if (model.patch_bias) {
             inp = ggml_add(ctx0, inp, model.patch_bias);
             cb(inp, "patch_bias", -1);
+            LOG_INF("%s: built patch bias\n", __func__);
         }
+        LOG_INF("%s: built input tensor with shape [%d, %d]\n", __func__, inp->ne[0], inp->ne[1]);
         return inp;
     }
 
@@ -1969,6 +2165,10 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             {
                 res = graph.build_siglip();
             } break;
+        case PROJECTOR_TYPE_GLM45V:
+            {
+                res = graph.build_glm45v();
+            } break;
         case PROJECTOR_TYPE_PIXTRAL:
             {
                 res = graph.build_pixtral();
@@ -2093,6 +2293,7 @@ struct clip_model_loader {
         std::string proj_type;
         {
             get_string(KEY_PROJ_TYPE, proj_type, false);
+            LOG_INF("%s: projector type: %s\n", __func__, proj_type.c_str());
             if (!proj_type.empty()) {
                 model.proj_type = clip_projector_type_from_string(proj_type);
             }
@@ -2250,6 +2451,22 @@ struct clip_model_loader {
                         hparams.proj_scale_factor = 4;
                         // test model (tinygemma3) has a different value, we optionally read it
                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.proj_scale_factor, false);
+                    } break;
+                case PROJECTOR_TYPE_GLM45V:
+                    {
+                        // GLM-4.5V vision path uses 2-D RoPE (theta=10000), RMSNorm, and a spatial merge of 2
+                        hparams.rope_theta = 10000.0f;
+
+                        // spatial merge size is fixed at 2, but read if present (optional)
+                        get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.spatial_merge_size, /*required=*/false);
+                        if (hparams.spatial_merge_size == 0) hparams.spatial_merge_size = 2;
+
+                        // no separate projector head; the merger outputs text hidden size (4096)
+                        // keep default warmup; ensure image size respects the vision backbone (24x24 patches @14px = 336)
+                        if (hparams.image_size == 0) hparams.image_size = hparams.patch_size * 24;
+
+                        // ViT uses RMS inside blocks for this model
+                        // leave ffn_op as read from flags (silu in your gguf), fallback already handled above
                     } break;
                 case PROJECTOR_TYPE_QWEN2VL:
                     {
@@ -2529,6 +2746,37 @@ struct clip_model_loader {
                     model.mm_input_proj_w = get_tensor(TN_MM_INP_PROJ);
                     model.mm_soft_emb_norm_w = get_tensor(TN_MM_SOFT_EMB_N);
                 } break;
+            case PROJECTOR_TYPE_GLM45V:
+                {
+                    // Post-conv RMSNorm
+                    model.glm_post_conv_rms_w = get_tensor("glm4v.post_conv_rmsnorm.weight");
+
+                    // Post-ViT RMSNorm
+                    model.glm_post_rms_w      = get_tensor("glm4v.post_rmsnorm.weight");
+
+                    // Downsample conv (kernel=stride=2) to 4096
+                    model.glm_downsample_w    = get_tensor("glm4v.downsample.weight");
+                    model.glm_downsample_b    = get_tensor("glm4v.downsample.bias", /*required=*/false);
+
+                    // PatchMerger: proj → LN → gated-MLP (SwiGLU) → down
+                    model.glm_merger_proj_w   = get_tensor("glm4v.merger.proj.weight");
+                    model.glm_merger_proj_b   = get_tensor("glm4v.merger.proj.bias",  /*required=*/false);
+
+                    model.glm_merger_ln_w     = get_tensor("glm4v.merger.ln.weight");
+                    model.glm_merger_ln_b     = get_tensor("glm4v.merger.ln.bias");
+
+                    model.glm_merger_gate_w   = get_tensor("glm4v.merger.mlp.gate");
+                    model.glm_merger_up_w     = get_tensor("glm4v.merger.mlp.up");
+                    model.glm_merger_down_w   = get_tensor("glm4v.merger.mlp.down");
+
+                    model.glm_merger_gate_b   = get_tensor("glm4v.merger.mlp.gate_bias", /*required=*/false);
+                    model.glm_merger_up_b     = get_tensor("glm4v.merger.mlp.up_bias",   /*required=*/false);
+                    model.glm_merger_down_b   = get_tensor("glm4v.merger.mlp.down_bias", /*required=*/false);
+
+                    // NOTE:
+                    //  - ViT block weights (q/k/v/o + RMS ln_1/ln_2 + FFN) are already loaded in the generic loop above.
+                    //  - For this config attention biases are absent (we mark them optional in the loop already).
+                } break;
             case PROJECTOR_TYPE_IDEFICS3:
                 {
                     model.projection = get_tensor(TN_MM_PROJECTOR);
@@ -2645,7 +2893,7 @@ struct clip_model_loader {
             img->ny = hparams.n_mel_bins;
         }
         batch.entries.push_back(std::move(img));
-
+        LOG_INF("%s: built compute graph for warmup batch\n", __func__);
         ggml_cgraph * gf = clip_image_build_graph(&ctx_clip, batch);
         ggml_backend_sched_reserve(ctx_clip.sched.get(), gf);
 
@@ -2749,6 +2997,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION);
             loader.load_tensors(*ctx_vision);
             loader.alloc_compute_meta(*ctx_vision);
+            LOG_INF("%s: loaded vision model from '%s'\n", __func__, fname);
         }
 
         if (loader.has_audio) {
@@ -3630,6 +3879,17 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
                     n_patches_sq /= 2;
                 }
             } break;
+        case PROJECTOR_TYPE_GLM45V:
+            {
+                const int S = params.spatial_merge_size > 0 ? params.spatial_merge_size : 1; // GLM-4.5V: S=2
+                int per_side = params.image_size / params.patch_size;         // e.g., 336/14 = 24
+                // (optionally) enforce divisibility if you want strictness:
+                // GGML_ASSERT(per_side * params.patch_size == params.image_size);
+                // GGML_ASSERT((per_side % S) == 0);
+
+                per_side /= S;                                                // 24/2 = 12
+                n_patches_sq = per_side * per_side;                           // 12*12 = 144
+            } break;
         default:
             GGML_ABORT("unsupported projector type");
     }
@@ -3837,6 +4097,29 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         std::memcpy(inp_raw.data(), mel_inp->buf.data(), n_step * n_mel * sizeof(float));
         set_input_f32("inp_raw", inp_raw);
     }
+    auto fill_blocked_hw = [](int W, int H, int m, std::vector<int32_t> &Hpos, std::vector<int32_t> &Wpos) {
+        GGML_ASSERT(W % m == 0 && H % m == 0);
+        Hpos.resize(W*H);
+        Wpos.resize(W*H);
+
+        const int By = H / m;     // blocks vertically
+        const int Bx = W / m;     // blocks horizontally
+        int idx = 0;
+
+        for (int by = 0; by < By; ++by) {
+            for (int bx = 0; bx < Bx; ++bx) {
+                for (int iy = 0; iy < m; ++iy) {
+                    for (int ix = 0; ix < m; ++ix) {
+                        const int y = by * m + iy;
+                        const int x = bx * m + ix;
+                        Hpos[idx] = y / m;
+                        Wpos[idx] = x / m;
+                        ++idx;
+                    }
+                }
+            }
+        }
+    };
 
     // set input per projector
     switch (ctx->model.proj_type) {
@@ -4055,6 +4338,25 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                 }
                 set_input_i32("pos_w", pos_data);
             } break;
+        case PROJECTOR_TYPE_GLM45V:  // <-- or whichever you wired for GLM-4.5V
+            {
+                LOG_INF("%s: Using GLM-4.5V projector type\n", __func__);
+                LOG_INF("%s: Image size: %dx%d, patch size: %d\n", __func__, image_size_width, image_size_height, patch_size);
+                const int W = image_size_width  / patch_size;  // n_patches_x
+                const int H = image_size_height / patch_size;  // n_patches_y
+                const int m = std::max(1, hparams.spatial_merge_size); // GLM-4.5V uses 2
+
+                std::vector<int32_t> hpos, wpos;
+                LOG_INF("%s: calling fill_blocked_hw()\n", __func__);
+                fill_blocked_hw(W, H, m, hpos, wpos);
+                LOG_INF("%s: fill_blocked_hw() done\n", __func__);
+                // no CLS in the ViT token stream for this path, so length = W*H
+                GGML_ASSERT((int)hpos.size() == W*H && (int)wpos.size() == W*H);
+                LOG_INF("%s: setting pos_h and pos_w\n", __func__);
+                set_input_i32("pos_h", hpos);
+                set_input_i32("pos_w", wpos);
+                LOG_INF("%s: setting pos_h and pos_w done\n", __func__);
+            } break;
         default:
             GGML_ABORT("Unknown projector type");
     }
@@ -4135,6 +4437,10 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
             return ctx->model.mm_model_proj->ne[1];
         case PROJECTOR_TYPE_QWEN2A:
             return ctx->model.mm_fc_w->ne[1];
+        case PROJECTOR_TYPE_GLM45V:
+            // glm4.5v downsample conv: [2, 2, 1536, 4096] => c_out is the mm embedding dim
+            GGML_ASSERT(ctx->model.glm_downsample_w);
+            return ctx->model.glm_downsample_w->ne[3];
         default:
             GGML_ABORT("Unknown projector type");
     }
