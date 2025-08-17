@@ -2868,6 +2868,7 @@ class VisionProjectorType:
     QWEN2A = "qwen2a" # audio
     QWEN25O = "qwen2.5o" # omni
     VOXTRAL = "voxtral"
+    LFM2 = "lfm2"
 
 
 # Items here are (block size, type size)
