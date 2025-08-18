@@ -734,7 +734,10 @@ struct clip_graph {
 
         cur = ggml_conv_2d(ctx0, wds, cur, S, S, 0, 0, 1, 1);
         if (model.glm_downsample_b) {
-            cur = ggml_add(ctx0, cur, model.glm_downsample_b);
+            ggml_tensor *b = ggml_reshape_4d(ctx0, model.glm_downsample_b,
+                                1, 1, model.glm_downsample_w->ne[3], 1);
+            b = ggml_repeat(ctx0, b, cur);
+            cur = ggml_add(ctx0, cur, b);
         }
 
         LOG_INF("%s: built downsample conv layer\n", __func__);
@@ -3720,6 +3723,7 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, str
     else if (ctx->proj_type() == PROJECTOR_TYPE_GLM_EDGE
             || ctx->proj_type() == PROJECTOR_TYPE_GEMMA3
             || ctx->proj_type() == PROJECTOR_TYPE_IDEFICS3
+            || ctx->proj_type() == PROJECTOR_TYPE_GLM45V
             || ctx->proj_type() == PROJECTOR_TYPE_INTERNVL // TODO @ngxson : support dynamic resolution
     ) {
         clip_image_u8 resized_image;

@@ -6911,6 +6911,7 @@ class Glm4MoeModel(TextModel):
                 """{% set content = visible_text(m.content) %}{{ content }}\n{{- '/nothink' if (enable_thinking is defined and not enable_thinking and not content.endswith("/nothink")) else '' -}}""")
 
         special_vocab.add_to_gguf(self.gguf_writer)
+        return special_vocab
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
@@ -7023,7 +7024,13 @@ class Glm4vMoeModel(Glm4MoeModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-
+    def set_vocab(self):
+        special_vocab = super().set_vocab()
+        if isinstance(special_vocab.chat_template, str) and "visible_text(m.content).endswith" in special_vocab.chat_template:
+            special_vocab.chat_template = special_vocab.chat_template.replace(
+                """{{- '/nothink' if (enable_thinking is defined and not enable_thinking and not visible_text(m.content).endswith("/nothink")) else '' -}}""",
+                """{# prepend '/nothink' if thinking is disabled and content doesn't already end with it #}\n{%- set _c = m.content | trim -%}\n{%- if (enable_thinking == false) and (_c[-8:] != '/nothink') -%}/nothink{%- endif -%}""")
+            self.gguf_writer.add_chat_template(special_vocab.chat_template)
     # --------------- gguf params ---------------
 
     def set_gguf_parameters(self):

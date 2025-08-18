@@ -192,9 +192,9 @@ struct mtmd_context {
 
     void init_vision() {
         GGML_ASSERT(ctx_v != nullptr);
-        use_mrope = clip_is_qwen2vl(ctx_v);
-
+        
         projector_type proj = clip_get_projector_type(ctx_v);
+        use_mrope = clip_is_qwen2vl(ctx_v) || proj == PROJECTOR_TYPE_GLM45V;
         int minicpmv_version = clip_is_minicpmv(ctx_v);
         if (minicpmv_version == 2) {
             // minicpmv 2.5 format:

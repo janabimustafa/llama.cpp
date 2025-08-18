@@ -30,11 +30,14 @@ unchanged, only the alias strings were touched.
 """
 
 import argparse
+import sys
+import os
 from pathlib import Path
 import numpy as np
 import torch
-
-from gguf import GGUFWriter
+if 'NO_LOCAL_GGUF' not in os.environ:
+    sys.path.insert(1, str(Path(__file__).parent / 'gguf-py'))
+from gguf import GGUFWriter, VisionProjectorType
 
 # -------------------- helpers --------------------
 
@@ -77,9 +80,11 @@ def _write_meta_for_loader(gg: GGUFWriter, vis_cfg, text_cfg, image_mean, image_
     gg.add_string("mmproj.architecture",  "glm4v_moe")
 
     # KEY_* macros
-    gg.add_bool("clip.has_vision_encoder", True)
-    gg.add_bool("clip.has_audio_encoder",  False)
-    gg.add_string("clip.projector_type", "glm4v_moe")
+    gg.add_clip_projector_type(VisionProjectorType.GLM4VMOE)
+    gg.add_vision_use_silu(True)
+    gg.add_clip_has_audio_encoder(False)
+    gg.add_clip_has_vision_encoder(True)
+    # gg.add_string("clip.projector_type", "glm4v_moe")
 
     # Parameter extraction
     n_embd    = int(vis_cfg.hidden_size)
@@ -94,7 +99,7 @@ def _write_meta_for_loader(gg: GGUFWriter, vis_cfg, text_cfg, image_mean, image_
     eps_attn  = float(getattr(vis_cfg, "attn_rms_norm_eps", eps_glob))
     spatial_merge = int(getattr(vis_cfg, "spatial_merge_size", 0))
 
-    # Vision encoder hparams – canonical first
+    # Vision encoder hparams – canonical firsts
     gg.add_uint32("clip.vision.embedding_length",    n_embd)
     gg.add_uint32("clip.vision.block_count",         n_block)
     gg.add_uint32("clip.vision.feed_forward_length", n_ff)
