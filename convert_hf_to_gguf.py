@@ -7012,17 +7012,11 @@ class Glm4MoeModel(TextModel):
 @ModelBase.register("Glm4vMoeForConditionalGeneration")
 class Glm4vMoeModel(Glm4MoeModel):
     """
-    GLM-4.5V text-only exporter compatible with the existing GLM4_MOE tensor map.
-    - Ignores vision tensors
-    - Strips 'model.language_model.' prefix
-    - Writes mRoPE metadata
-    - Packs routed experts per layer into 3 tensors:
-        * experts.down_proj.weight   -> FFN_DOWN_EXP
-        * experts.gate_proj.weight   -> FFN_GATE_EXP
-        * experts.up_proj.weight     -> FFN_UP_EXP
-      (If checkpoint stores fused gate_up_proj, we split it into gate/up.)
-    - Leaves shared experts under 'shared_experts.(gate_proj|up_proj|down_proj).*'
-      so they hit FFN_*_SHEXP buckets.
+    GLM-4.5V text-only exporter works similar to GLM4_MOE with a couple of exceptions:
+    - Uses MRoPE with 3 MRoPE sections instead of RoPE
+    - Bias enabled in K/Q/V projections
+    - Smaller 65536 token context length
+    - 
     """
     model_arch = gguf.MODEL_ARCH.GLM4V_MOE
 
@@ -7034,127 +7028,11 @@ class Glm4vMoeModel(Glm4MoeModel):
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
+        mrope_section = self.hparams["rope_scaling"]["mrope_section"]
+        mrope_section += [0] * max(0, 4 - len(mrope_section))
+        self.gguf_writer.add_rope_dimension_sections(mrope_section)
 
-        rope_dim = self.hparams.get("head_dim") or (self.hparams["hidden_size"] // self.hparams["num_attention_heads"])
-        # mRoPE hints (optional metadata; runtime still needs codepaths)
-        self._meta("rope.mrope_enabled", True)
-        rs = self.hparams.get("rope_scaling") or {}
-        if "mrope_section" in rs:
-            self._meta("rope.mrope_section", rs["mrope_section"])  # e.g. [8,12,12]
-        self.gguf_writer.add_rope_dimension_count(int(rope_dim * self.hparams.get("partial_rotary_factor", 0.5)))
 
-        # MoE parameters (same style as Glm4MoeModel)
-        if (v := self.hparams.get("n_routed_experts")) is not None:
-            self.gguf_writer.add_expert_count(int(v))
-        if (v := self.hparams.get("moe_intermediate_size")) is not None:
-            self.gguf_writer.add_expert_feed_forward_length(int(v))
-        if (v := self.hparams.get("n_shared_experts")) is not None:
-            self.gguf_writer.add_expert_shared_count(int(v))
-        if (v := self.hparams.get("first_k_dense_replace")) is not None:
-            self.gguf_writer.add_leading_dense_block_count(int(v))
-
-        self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
-        if (v := self.hparams.get("routed_scaling_factor")) is not None:
-            self.gguf_writer.add_expert_weights_scale(float(v))
-        if (v := self.hparams.get("norm_topk_prob")) is not None:
-            self.gguf_writer.add_expert_weights_norm(bool(v))
-        if (v := self.hparams.get("num_nextn_predict_layers")) is not None:
-            self.gguf_writer.add_nextn_predict_layers(int(v))
-
-    # --------------- tensor mapping ---------------
-
-    def modify_tensors(self, data_torch: Tensor, name: str, bid: Optional[int]) -> Iterable[Tuple[str, Tensor]]:
-        # ignore vision
-        if name.startswith("model.visual."):
-            return []
-
-        # strip multimodal prefix
-        if name.startswith("model.language_model."):
-            name = "model." + name[len("model.language_model."):]
-
-        # embeddings
-        if name == "model.embed_tokens.weight" and ".layers." not in name:
-            return [(self.map_tensor_name("token_embd.weight"), data_torch)]
-
-        # routed experts -> stash & emit when complete
-        if ".mlp.experts." in name:
-            assert bid is not None, "expert tensor without block id"
-            if self._experts is None:
-                self._experts = [{} for _ in range(self.block_count)]
-            self._experts[bid][name] = data_torch
-
-            out = self._maybe_emit_experts_like_glm4(bid, int(self.hparams["n_routed_experts"]))
-            return out if out is not None else []
-
-        # shared experts: DO NOT rename; leave as 'shared_experts.*'
-        if bid is not None and f"model.layers.{bid}.mlp.shared_experts." in name:
-            return [(self.map_tensor_name(name), data_torch)]
-
-        # rare rename
-        if name.endswith("e_score_correction_bias"):
-            name = name.replace("e_score_correction_bias", "e_score_correction.bias")
-
-        return [(self.map_tensor_name(name), data_torch)]
-
-    # --------------- expert packer ---------------
-
-    def _maybe_emit_experts_like_glm4(self, bid: int, n_experts: int) -> Optional[List[Tuple[str, Tensor]]]:
-        """
-        Produce the 3 merged routed-expert tensors per layer with names that match
-        FFN_*_EXP in tensor_mapping.py:
-          - model.layers.{bid}.mlp.experts.down_proj.weight  [E, O, I]
-          - model.layers.{bid}.mlp.experts.gate_proj.weight  [E, O, I]
-          - model.layers.{bid}.mlp.experts.up_proj.weight    [E, O, I]
-        Accept either split (gate_proj & up_proj) or fused (gate_up_proj) from HF.
-        Only weights are merged (like Glm4MoeModel).
-        """
-        stash = self._experts[bid]
-
-        def have_all(part: str) -> bool:
-            return all(f"model.layers.{bid}.mlp.experts.{x}.{part}.weight" in stash for x in range(n_experts))
-
-        have_down    = have_all("down_proj")
-        have_gate    = have_all("gate_proj")
-        have_up      = have_all("up_proj")
-        have_gate_up = have_all("gate_up_proj")
-
-        if not have_down or not ((have_gate and have_up) or have_gate_up):
-            return None
-
-        out: List[Tuple[str, Tensor]] = []
-
-        # down_proj -> [E, O, I]
-        downs = [stash.pop(f"model.layers.{bid}.mlp.experts.{x}.down_proj.weight") for x in range(n_experts)]
-        W_down = torch.stack(downs, dim=0)
-        out.append((self.map_tensor_name(f"model.layers.{bid}.mlp.experts.down_proj.weight"), W_down))
-
-        # gate/up: split or fused->split
-        if have_gate and have_up:
-            gates = [stash.pop(f"model.layers.{bid}.mlp.experts.{x}.gate_proj.weight") for x in range(n_experts)]
-            ups   = [stash.pop(f"model.layers.{bid}.mlp.experts.{x}.up_proj.weight")   for x in range(n_experts)]
-            W_gate = torch.stack(gates, dim=0)
-            W_up   = torch.stack(ups,   dim=0)
-        else:
-            fused = [stash.pop(f"model.layers.{bid}.mlp.experts.{x}.gate_up_proj.weight") for x in range(n_experts)]
-            W_fused = torch.stack(fused, dim=0)      # [E, 2O, I]
-            O2 = W_fused.shape[1]
-            assert O2 % 2 == 0, f"Expected even 2O for gate_up_proj, got {O2}"
-            O = O2 // 2
-            W_gate = W_fused[:, :O, :].contiguous()  # [E, O, I]
-            W_up   = W_fused[:,  O:, :].contiguous() # [E, O, I]
-
-        out.append((self.map_tensor_name(f"model.layers.{bid}.mlp.experts.gate_proj.weight"), W_gate))
-        out.append((self.map_tensor_name(f"model.layers.{bid}.mlp.experts.up_proj.weight"),   W_up))
-        return out
-
-    # --------------- finalize ---------------
-
-    def prepare_tensors(self):
-        super().prepare_tensors()
-        if self._experts is not None:
-            leftovers = [k for d in self._experts for k in d.keys()]
-            if leftovers:
-                raise ValueError(f"Unprocessed experts: {leftovers}")
 @ModelBase.register("Glm4vMoeForConditionalGeneration")
 class Glm4vMoeModel(MmprojModel):
     """
